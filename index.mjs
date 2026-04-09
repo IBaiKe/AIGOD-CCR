@@ -563,6 +563,16 @@ createServer(async (req, res) => {
   res.setHeader("Access-Control-Allow-Headers", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
   if (req.method === "OPTIONS") return res.writeHead(204).end();
+
+  // ─── Health check（无需认证） ───
+  if (req.url === "/" || req.url === "/health") {
+    return J(res, 200, {
+      status: "ok",
+      message: "Replit AI Proxy is running",
+      endpoints: ["/v1/models", "/v1/chat/completions"],
+    });
+  }
+
   if (req.headers.authorization !== `Bearer ${KEY}`)
     return J(res, 401, {
       error: { message: "Unauthorized", type: "auth_error" },
@@ -808,15 +818,6 @@ createServer(async (req, res) => {
         error: { message: e.message, type: "proxy_error" },
       });
     }
-  }
-
-  // ─── Health check ───
-  if (req.url === "/" || req.url === "/health") {
-    return J(res, 200, {
-      status: "ok",
-      message: "Replit AI Proxy is running",
-      endpoints: ["/v1/models", "/v1/chat/completions"],
-    });
   }
 
   J(res, 404, { error: { message: "Not found" } });
