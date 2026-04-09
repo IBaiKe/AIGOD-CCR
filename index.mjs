@@ -27,6 +27,35 @@ if (existsSync(KEY_FILE)) {
 const mapAnthropicModel = (m) => m;
 
 // ─────────────────────────────────────────────────────────
+//  清理 cache_control：移除上游 API 不支持的额外字段（如 scope）
+//  Claude Code 会发送 cache_control: { type: "ephemeral", scope: "..." }
+//  但 Replit AI Integrations 上游只接受 { type: "ephemeral" }
+// ─────────────────────────────────────────────────────────
+function stripCacheControl(body) {
+  // 清理 system 中的 cache_control
+  if (Array.isArray(body.system)) {
+    for (const block of body.system) {
+      if (block && block.cache_control) {
+        // 只保留 type 字段，移除 scope 等额外字段
+        block.cache_control = { type: block.cache_control.type };
+      }
+    }
+  }
+  // 清理 messages 中的 cache_control
+  if (Array.isArray(body.messages)) {
+    for (const msg of body.messages) {
+      if (Array.isArray(msg.content)) {
+        for (const block of msg.content) {
+          if (block && block.cache_control) {
+            block.cache_control = { type: block.cache_control.type };
+          }
+        }
+      }
+    }
+  }
+}
+
+// ─────────────────────────────────────────────────────────
 //  日志工具
 // ─────────────────────────────────────────────────────────
 let reqCounter = 0;
@@ -938,6 +967,9 @@ createServer(async (req, res) => {
       p.model = mappedModel;
     }
 
+    // 清理 cache_control 中上游不支持的字段
+    stripCacheControl(p);
+
     log(
       reqId,
       `  [/v1/messages] model=${originalModel}→${mappedModel} stream=${!!p.stream} messages=${(p.messages || []).length}`,
@@ -1050,7 +1082,9 @@ createServer(async (req, res) => {
   );
   console.log(`========================================`);
   console.log(`  Anthropic 原生 API 透传 (Claude Code 等):`);
-  console.log(`  模型名: 原样透传给上游 API (claude-opus-4-6, claude-sonnet-4-6 等)`);
+  console.log(
+    `  模型名: 原样透传给上游 API (claude-opus-4-6, claude-sonnet-4-6 等)`,
+  );
   console.log(`  ANTHROPIC_BASE_URL=${base.replace("/v1", "")} \\`);
   console.log(`  ANTHROPIC_API_KEY=${KEY} \\`);
   console.log(`  claude`);
