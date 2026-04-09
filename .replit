@@ -1,6 +1,10 @@
 run = "node index.mjs"
 entrypoint = "index.mjs"
 
+[agent]
+expertMode = true
+integrations = ["javascript_anthropic_ai_integrations:2.0.0"]
+
 [nix]
 channel = "stable-24_05"
 
