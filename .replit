@@ -1,3 +1,5 @@
+modules = ["nodejs-20"]
+
 run = "node index.mjs"
 entrypoint = "index.mjs"
 
@@ -9,8 +11,8 @@ integrations = ["javascript_anthropic_ai_integrations:2.0.0", "javascript_openai
 channel = "stable-24_05"
 
 [deployment]
-run = ["sh", "-c", "node index.mjs"]
-deploymentTarget = "cloudrun"
+run = ["node", "index.mjs"]
+deploymentTarget = "autoscale"
 
 [[ports]]
 localPort = 3000
