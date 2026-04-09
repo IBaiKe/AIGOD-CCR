@@ -1,13 +1,15 @@
 # Replit AI Proxy — OpenAI Compatible API Gateway
 
-零依赖 Node.js 18+ AI 代理服务，对外完全兼容 OpenAI Chat Completions API，内部自动路由到 Anthropic Claude / OpenAI / Google Gemini / OpenRouter，并在 Claude 场景下实现完整的 tool calling 双向协议转换。
+零依赖 Node.js 18+ AI 代理服务，对外完全兼容 OpenAI Chat Completions API，同时支持 Anthropic 原生 `/v1/messages` 端点透传（可直接用于 Claude Code 等原生客户端）。内部自动路由到 Anthropic Claude / OpenAI / Google Gemini / OpenRouter，并在 Claude 场景下实现完整的 tool calling 双向协议转换。
 
 ## 特性
 
 - **OpenAI API 兼容**：客户端使用标准 OpenAI SDK 即可调用所有支持的模型
+- **Anthropic 原生 API 透传**：支持 `/v1/messages` 端点，可直接用于 Claude Code、Anthropic SDK 等原生客户端
 - **多模型路由**：自动根据模型名称路由到对应后端（Anthropic / OpenAI / Gemini / OpenRouter）
 - **Claude Tool Calling 双向转换**：完整实现 OpenAI `tools/tool_calls` ↔ Anthropic `tool_use/tool_result` 协议映射
 - **流式支持**：非流式和流式（SSE）均支持，包括流式 tool calling 增量事件
+- **双重认证**：同时支持 `Authorization: Bearer <KEY>` 和 `x-api-key: <KEY>` 认证方式
 - **零依赖**：仅使用 Node.js 内置模块，无需 npm install
 
 ## 支持的模型
@@ -49,6 +51,16 @@
 
 列出所有可用模型。
 
+### `POST /v1/messages`
+
+Anthropic 原生 Messages API 透传端点。请求和响应格式与 Anthropic 官方 API 完全一致，代理会原样转发到后端 Anthropic 服务，支持流式和非流式。
+
+此端点同时支持两种认证方式：
+- `Authorization: Bearer <API-KEY>`
+- `x-api-key: <API-KEY>`
+
+支持透传所有 `anthropic-*` 请求头（如 `anthropic-version`、`anthropic-beta` 等）。
+
 ### `POST /v1/chat/completions`
 
 标准 OpenAI Chat Completions 接口，支持：
@@ -63,6 +75,41 @@
 ### `GET /` 或 `GET /health`
 
 健康检查。
+
+## 在 Claude Code 中使用
+
+本代理支持 Anthropic 原生 `/v1/messages` 端点透传，因此可以直接配合 Claude Code 使用。
+
+### 配置方法
+
+设置以下环境变量后启动 Claude Code：
+
+```bash
+# Linux / macOS
+export ANTHROPIC_BASE_URL=https://YOUR-REPLIT-DOMAIN/v1
+export ANTHROPIC_API_KEY=YOUR-PROXY-KEY
+claude
+
+# Windows (PowerShell)
+$env:ANTHROPIC_BASE_URL = "https://YOUR-REPLIT-DOMAIN/v1"
+$env:ANTHROPIC_API_KEY = "YOUR-PROXY-KEY"
+claude
+
+# Windows (CMD)
+set ANTHROPIC_BASE_URL=https://YOUR-REPLIT-DOMAIN/v1
+set ANTHROPIC_API_KEY=YOUR-PROXY-KEY
+claude
+```
+
+其中：
+- `YOUR-REPLIT-DOMAIN` 替换为你的 Replit 部署域名
+- `YOUR-PROXY-KEY` 替换为代理服务启动时生成的 API Key（显示在控制台输出中）
+
+### 注意事项
+
+- Claude Code 会使用 Anthropic 官方模型名（如 `claude-sonnet-4-20250514`），代理会原样透传给后端
+- 代理同时支持 `x-api-key` 和 `Authorization: Bearer` 两种认证方式，完全兼容 Claude Code 的认证机制
+- 流式和非流式请求均会原样透传，不做任何格式转换
 
 ## Claude Tool Calling 协议转换说明
 
@@ -245,7 +292,9 @@ rep-ccgod/
 ## 认证
 
 - API Key 首次运行时自动生成，持久化到 `.proxy-key` 文件
-- 所有请求需在 `Authorization` header 中携带 `Bearer <API-KEY>`
+- 支持两种认证方式（所有端点均通用）：
+  - `Authorization: Bearer <API-KEY>`（OpenAI 风格）
+  - `x-api-key: <API-KEY>`（Anthropic 风格，兼容 Claude Code）
 
 ## License
 

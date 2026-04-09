@@ -569,11 +569,15 @@ createServer(async (req, res) => {
     return J(res, 200, {
       status: "ok",
       message: "Replit AI Proxy is running",
-      endpoints: ["/v1/models", "/v1/chat/completions"],
+      endpoints: ["/v1/models", "/v1/chat/completions", "/v1/messages"],
     });
   }
 
-  if (req.headers.authorization !== `Bearer ${KEY}`)
+  // 支持 Bearer token 和 x-api-key 两种认证方式（兼容 Claude Code）
+  const authKey =
+    req.headers.authorization?.replace(/^Bearer\s+/i, "") ||
+    req.headers["x-api-key"];
+  if (authKey !== KEY)
     return J(res, 401, {
       error: { message: "Unauthorized", type: "auth_error" },
     });
@@ -820,6 +824,75 @@ createServer(async (req, res) => {
     }
   }
 
+  // ═══════════════════════════════════════════════════════
+  //  /v1/messages — Anthropic 原生 API 透传
+  //  Claude Code 等原生 Anthropic 客户端直接使用此端点
+  // ═══════════════════════════════════════════════════════
+  if (req.url === "/v1/messages" && req.method === "POST") {
+    const raw = await readBody(req);
+    let p;
+    try {
+      p = JSON.parse(raw);
+    } catch {
+      return J(res, 400, {
+        error: { message: "Invalid JSON body", type: "invalid_request_error" },
+      });
+    }
+
+    const { url, key } = creds("anthropic");
+    if (!url || !key) {
+      return J(res, 500, {
+        error: {
+          message:
+            "Missing AI Integrations credentials for provider: anthropic. Ensure AI_INTEGRATIONS_ANTHROPIC_BASE_URL and AI_INTEGRATIONS_ANTHROPIC_API_KEY are set.",
+          type: "api_error",
+        },
+      });
+    }
+
+    try {
+      // 收集客户端传入的 anthropic-* 头，原样透传
+      const fwdHeaders = {
+        "Content-Type": "application/json",
+        "x-api-key": key,
+      };
+      for (const [h, v] of Object.entries(req.headers)) {
+        if (h.startsWith("anthropic-")) {
+          fwdHeaders[h] = v;
+        }
+      }
+      // 确保至少有 anthropic-version
+      if (!fwdHeaders["anthropic-version"]) {
+        fwdHeaders["anthropic-version"] = "2023-06-01";
+      }
+
+      const up = await fetch(`${url}/messages`, {
+        method: "POST",
+        headers: fwdHeaders,
+        body: raw,
+      });
+
+      if (p.stream) {
+        // 流式：原样透传 SSE
+        res.writeHead(up.status, {
+          "Content-Type": "text/event-stream",
+          "Cache-Control": "no-cache",
+          Connection: "keep-alive",
+        });
+        return pipe(up.body.getReader(), res);
+      }
+
+      // 非流式：原样透传 JSON
+      const data = await up.text();
+      res.writeHead(up.status, { "Content-Type": "application/json" });
+      return res.end(data);
+    } catch (e) {
+      return J(res, 502, {
+        error: { message: e.message, type: "proxy_error" },
+      });
+    }
+  }
+
   J(res, 404, { error: { message: "Not found" } });
 }).listen(PORT, () => {
   const domain = process.env.REPLIT_DEV_DOMAIN || `localhost:${PORT}`;
@@ -838,6 +911,11 @@ createServer(async (req, res) => {
   console.log(
     `    -d '{"model":"claude-sonnet-4-6","messages":[{"role":"user","content":"hi"}]}'`,
   );
+  console.log(`========================================`);
+  console.log(`  Anthropic 原生 API 透传 (Claude Code 等):`);
+  console.log(`  ANTHROPIC_BASE_URL=${base.replace("/v1", "")} \\`);
+  console.log(`  ANTHROPIC_API_KEY=${KEY} \\`);
+  console.log(`  claude`);
   console.log(`========================================`);
   console.log(`  Tool Calling 示例:`);
   console.log(`  curl ${base}/chat/completions \\`);
