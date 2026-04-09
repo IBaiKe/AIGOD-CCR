@@ -1,0 +1,15 @@
+{
+  "name": "replit-ai-proxy",
+  "version": "1.0.0",
+  "description": "OpenAI-compatible AI proxy with full Claude tool calling protocol conversion",
+  "main": "index.mjs",
+  "type": "module",
+  "scripts": {
+    "start": "node index.mjs"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "keywords": [],
+  "license": "MIT"
+}

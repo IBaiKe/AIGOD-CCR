@@ -1,0 +1,13 @@
+run = "node index.mjs"
+entrypoint = "index.mjs"
+
+[nix]
+channel = "stable-24_05"
+
+[deployment]
+run = ["sh", "-c", "node index.mjs"]
+deploymentTarget = "cloudrun"
+
+[[ports]]
+localPort = 3000
+externalPort = 80
