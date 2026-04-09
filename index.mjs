@@ -4,6 +4,7 @@
 //
 // 完整支持 OpenAI <-> Anthropic Claude tool calling 双向协议转换
 // 支持非流式和流式模式下的 tool_use / tool_calls 映射
+// 支持 Anthropic 原生 /v1/messages 端点透传（Claude Code 等）
 
 import { createServer } from "node:http";
 import { randomBytes } from "node:crypto";
@@ -17,6 +18,38 @@ if (existsSync(KEY_FILE)) {
 } else {
   KEY = "sk-replit-" + randomBytes(5).toString("hex");
   writeFileSync(KEY_FILE, KEY);
+}
+
+// ─────────────────────────────────────────────────────────
+//  模型名映射：自定义短名 → Anthropic 官方模型名
+//  Claude Code 等客户端可能用任意一种名称，都需要正确映射
+// ─────────────────────────────────────────────────────────
+const ANTHROPIC_MODEL_MAP = {
+  // 自定义短名 → 官方名
+  "claude-opus-4-6": "claude-opus-4-20250918",
+  "claude-opus-4-5": "claude-opus-4-20250514",
+  "claude-opus-4-1": "claude-opus-4-20250414",
+  "claude-sonnet-4-6": "claude-sonnet-4-20250514",
+  "claude-sonnet-4-5": "claude-sonnet-4-20250514",
+  "claude-haiku-4-5": "claude-haiku-4-20250414",
+  // 常见别名
+  "claude-4-opus": "claude-opus-4-20250918",
+  "claude-4-sonnet": "claude-sonnet-4-20250514",
+};
+
+/** 将模型名映射为 Anthropic 官方模型名，未匹配则原样返回 */
+const mapAnthropicModel = (m) => ANTHROPIC_MODEL_MAP[m] || m;
+
+// ─────────────────────────────────────────────────────────
+//  日志工具
+// ─────────────────────────────────────────────────────────
+let reqCounter = 0;
+const ts = () => new Date().toISOString();
+function log(reqId, ...args) {
+  console.log(`[${ts()}] [#${reqId}]`, ...args);
+}
+function logErr(reqId, ...args) {
+  console.error(`[${ts()}] [#${reqId}]`, ...args);
 }
 
 const creds = (p) => {
@@ -559,13 +592,18 @@ async function streamGemini(reader, res, model) {
 //  HTTP Server
 // ─────────────────────────────────────────────────────────
 createServer(async (req, res) => {
+  const reqId = ++reqCounter;
+  const startTime = Date.now();
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Headers", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
   if (req.method === "OPTIONS") return res.writeHead(204).end();
 
+  log(reqId, `→ ${req.method} ${req.url}`);
+
   // ─── Health check（无需认证） ───
   if (req.url === "/" || req.url === "/health") {
+    log(reqId, `← 200 health check (${Date.now() - startTime}ms)`);
     return J(res, 200, {
       status: "ok",
       message: "Replit AI Proxy is running",
@@ -577,13 +615,19 @@ createServer(async (req, res) => {
   const authKey =
     req.headers.authorization?.replace(/^Bearer\s+/i, "") ||
     req.headers["x-api-key"];
-  if (authKey !== KEY)
+  if (authKey !== KEY) {
+    log(
+      reqId,
+      `← 401 Unauthorized (auth method: ${req.headers["x-api-key"] ? "x-api-key" : req.headers.authorization ? "bearer" : "none"})`,
+    );
     return J(res, 401, {
       error: { message: "Unauthorized", type: "auth_error" },
     });
+  }
 
   // ─── /v1/models ───
   if (req.url === "/v1/models") {
+    log(reqId, `← 200 models list (${Date.now() - startTime}ms)`);
     const models = [
       // Anthropic
       { id: "claude-opus-4-6", owned_by: "anthropic" },
@@ -630,12 +674,19 @@ createServer(async (req, res) => {
     try {
       p = JSON.parse(raw);
     } catch {
+      log(reqId, `← 400 Invalid JSON body`);
       return J(res, 400, { error: { message: "Invalid JSON body" } });
     }
     const prov = route(p.model);
     const { url, key } = creds(prov);
 
+    log(
+      reqId,
+      `  model=${p.model} provider=${prov} stream=${!!p.stream} messages=${(p.messages || []).length} tools=${(p.tools || []).length}`,
+    );
+
     if (!url || !key) {
+      log(reqId, `← 500 Missing credentials for ${prov}`);
       return J(res, 500, {
         error: {
           message: `Missing AI Integrations credentials for provider: ${prov}. Ensure AI_INTEGRATIONS_${prov.toUpperCase()}_BASE_URL and AI_INTEGRATIONS_${prov.toUpperCase()}_API_KEY are set.`,
@@ -648,6 +699,7 @@ createServer(async (req, res) => {
       //  OpenAI / OpenRouter — 直接转发
       // ═══════════════════════════════════════════════════
       if (prov === "openai" || prov === "openrouter") {
+        log(reqId, `  → upstream ${prov} ${url}/chat/completions`);
         const up = await fetch(`${url}/chat/completions`, {
           method: "POST",
           headers: {
@@ -656,20 +708,33 @@ createServer(async (req, res) => {
           },
           body: raw,
         });
+        log(reqId, `  ← upstream ${up.status}`);
         if (p.stream) {
+          log(
+            reqId,
+            `  streaming response to client (${Date.now() - startTime}ms)`,
+          );
           res.writeHead(up.status, {
             "Content-Type": "text/event-stream",
             "Cache-Control": "no-cache",
           });
           return pipe(up.body.getReader(), res);
         }
-        return J(res, up.status, await up.json());
+        const respData = await up.json();
+        log(reqId, `← ${up.status} (${Date.now() - startTime}ms)`);
+        return J(res, up.status, respData);
       }
 
       // ═══════════════════════════════════════════════════
       //  Anthropic — 完整 OpenAI ↔ Claude 协议转换
       // ═══════════════════════════════════════════════════
       if (prov === "anthropic") {
+        // 映射模型名
+        const mappedModel = mapAnthropicModel(p.model);
+        if (mappedModel !== p.model) {
+          log(reqId, `  model mapping: ${p.model} → ${mappedModel}`);
+        }
+
         // 转换 messages
         const { system, messages } = convertMessagesToAnthropic(
           p.messages || [],
@@ -677,7 +742,7 @@ createServer(async (req, res) => {
 
         // 构建 Anthropic 请求体
         const anthropicBody = {
-          model: p.model,
+          model: mappedModel,
           max_tokens: p.max_tokens || 8192,
           messages,
         };
@@ -723,6 +788,10 @@ createServer(async (req, res) => {
             : [p.stop];
         }
 
+        log(
+          reqId,
+          `  → upstream anthropic ${url}/messages (model=${mappedModel})`,
+        );
         const up = await fetch(`${url}/messages`, {
           method: "POST",
           headers: {
@@ -733,20 +802,34 @@ createServer(async (req, res) => {
           body: JSON.stringify(anthropicBody),
         });
 
+        log(reqId, `  ← upstream ${up.status}`);
         if (!up.ok) {
           const errBody = await up.json().catch(() => ({
             error: { message: up.statusText },
           }));
+          logErr(
+            reqId,
+            `← ${up.status} upstream error:`,
+            JSON.stringify(errBody),
+          );
           return J(res, up.status, errBody);
         }
 
         // 流式
         if (p.stream) {
+          log(
+            reqId,
+            `  streaming response to client (${Date.now() - startTime}ms)`,
+          );
           return streamAnthropicWithTools(up.body.getReader(), res, p.model);
         }
 
         // 非流式 — 完整转换 (包含 tool_use 支持)
         const data = await up.json();
+        log(
+          reqId,
+          `← 200 finish_reason=${data.stop_reason} usage=[${data.usage?.input_tokens}/${data.usage?.output_tokens}] (${Date.now() - startTime}ms)`,
+        );
         return J(res, 200, convertAnthropicResponseToOpenAI(data, p.model));
       }
 
@@ -754,6 +837,7 @@ createServer(async (req, res) => {
       //  Gemini — OpenAI 格式 ↔ Google generateContent API
       // ═══════════════════════════════════════════════════
       if (prov === "gemini") {
+        log(reqId, `  → upstream gemini ${url}/models/${p.model}`);
         const sys = p.messages.find((m) => m.role === "system")?.content;
         const contents = p.messages
           .filter((m) => m.role !== "system")
@@ -787,14 +871,27 @@ createServer(async (req, res) => {
             },
           }),
         });
-        if (!up.ok)
-          return J(
-            res,
-            up.status,
-            await up.json().catch(() => ({ error: up.statusText })),
+        log(reqId, `  ← upstream ${up.status}`);
+        if (!up.ok) {
+          const errResp = await up
+            .json()
+            .catch(() => ({ error: up.statusText }));
+          logErr(
+            reqId,
+            `← ${up.status} upstream error:`,
+            JSON.stringify(errResp),
           );
-        if (p.stream) return streamGemini(up.body.getReader(), res, p.model);
+          return J(res, up.status, errResp);
+        }
+        if (p.stream) {
+          log(
+            reqId,
+            `  streaming response to client (${Date.now() - startTime}ms)`,
+          );
+          return streamGemini(up.body.getReader(), res, p.model);
+        }
         const d = await up.json();
+        log(reqId, `← 200 gemini (${Date.now() - startTime}ms)`);
         return J(res, 200, {
           id: rid(),
           object: "chat.completion",
@@ -818,6 +915,7 @@ createServer(async (req, res) => {
         });
       }
     } catch (e) {
+      logErr(reqId, `← 502 proxy error: ${e.message}`);
       return J(res, 502, {
         error: { message: e.message, type: "proxy_error" },
       });
@@ -828,19 +926,40 @@ createServer(async (req, res) => {
   //  /v1/messages — Anthropic 原生 API 透传
   //  Claude Code 等原生 Anthropic 客户端直接使用此端点
   // ═══════════════════════════════════════════════════════
-  if (req.url === "/v1/messages" && req.method === "POST") {
+  const parsedUrl = new URL(
+    req.url,
+    `http://${req.headers.host || "localhost"}`,
+  );
+  const pathname = parsedUrl.pathname;
+
+  if (pathname.startsWith("/v1/messages") && req.method === "POST") {
     const raw = await readBody(req);
     let p;
     try {
       p = JSON.parse(raw);
     } catch {
+      log(reqId, `← 400 Invalid JSON body`);
       return J(res, 400, {
         error: { message: "Invalid JSON body", type: "invalid_request_error" },
       });
     }
 
+    // 映射模型名
+    const originalModel = p.model;
+    const mappedModel = mapAnthropicModel(p.model);
+    if (mappedModel !== originalModel) {
+      log(reqId, `  model mapping: ${originalModel} → ${mappedModel}`);
+      p.model = mappedModel;
+    }
+
+    log(
+      reqId,
+      `  [/v1/messages] model=${originalModel}→${mappedModel} stream=${!!p.stream} messages=${(p.messages || []).length}`,
+    );
+
     const { url, key } = creds("anthropic");
     if (!url || !key) {
+      log(reqId, `← 500 Missing anthropic credentials`);
       return J(res, 500, {
         error: {
           message:
@@ -866,14 +985,31 @@ createServer(async (req, res) => {
         fwdHeaders["anthropic-version"] = "2023-06-01";
       }
 
-      const up = await fetch(`${url}/messages`, {
+      // 计算上游路径：/v1/messages/xxx → /messages/xxx
+      const upstreamPath = pathname.replace(/^\/v1/, "");
+      const upstreamQs = parsedUrl.search || "";
+      const upstreamUrl = `${url}${upstreamPath}${upstreamQs}`;
+
+      log(
+        reqId,
+        `  → upstream anthropic ${upstreamUrl} (model=${mappedModel})`,
+      );
+      // 用修改后的 body（模型名已映射）
+      const upBody = JSON.stringify(p);
+      const up = await fetch(upstreamUrl, {
         method: "POST",
         headers: fwdHeaders,
-        body: raw,
+        body: upBody,
       });
+
+      log(reqId, `  ← upstream ${up.status}`);
 
       if (p.stream) {
         // 流式：原样透传 SSE
+        log(
+          reqId,
+          `  streaming response to client (${Date.now() - startTime}ms)`,
+        );
         res.writeHead(up.status, {
           "Content-Type": "text/event-stream",
           "Cache-Control": "no-cache",
@@ -884,15 +1020,30 @@ createServer(async (req, res) => {
 
       // 非流式：原样透传 JSON
       const data = await up.text();
+      if (up.ok) {
+        try {
+          const parsed = JSON.parse(data);
+          log(
+            reqId,
+            `← ${up.status} stop_reason=${parsed.stop_reason} usage=[${parsed.usage?.input_tokens}/${parsed.usage?.output_tokens}] (${Date.now() - startTime}ms)`,
+          );
+        } catch {
+          log(reqId, `← ${up.status} (${Date.now() - startTime}ms)`);
+        }
+      } else {
+        logErr(reqId, `← ${up.status} upstream error: ${data.slice(0, 500)}`);
+      }
       res.writeHead(up.status, { "Content-Type": "application/json" });
       return res.end(data);
     } catch (e) {
+      logErr(reqId, `← 502 proxy error: ${e.message}`);
       return J(res, 502, {
         error: { message: e.message, type: "proxy_error" },
       });
     }
   }
 
+  log(reqId, `← 404 Not found`);
   J(res, 404, { error: { message: "Not found" } });
 }).listen(PORT, () => {
   const domain = process.env.REPLIT_DEV_DOMAIN || `localhost:${PORT}`;
@@ -913,6 +1064,7 @@ createServer(async (req, res) => {
   );
   console.log(`========================================`);
   console.log(`  Anthropic 原生 API 透传 (Claude Code 等):`);
+  console.log(`  模型名映射: ${Object.keys(ANTHROPIC_MODEL_MAP).join(", ")}`);
   console.log(`  ANTHROPIC_BASE_URL=${base.replace("/v1", "")} \\`);
   console.log(`  ANTHROPIC_API_KEY=${KEY} \\`);
   console.log(`  claude`);
