@@ -21,24 +21,10 @@ if (existsSync(KEY_FILE)) {
 }
 
 // ─────────────────────────────────────────────────────────
-//  模型名映射：自定义短名 → Anthropic 官方模型名
-//  Claude Code 等客户端可能用任意一种名称，都需要正确映射
+//  模型名透传：官方 API ID 已经是 claude-opus-4-6 等短名格式
+//  不做任何映射，原样传递给上游 API
 // ─────────────────────────────────────────────────────────
-const ANTHROPIC_MODEL_MAP = {
-  // 自定义短名 → 官方名
-  "claude-opus-4-6": "claude-opus-4-20250918",
-  "claude-opus-4-5": "claude-opus-4-20250514",
-  "claude-opus-4-1": "claude-opus-4-20250414",
-  "claude-sonnet-4-6": "claude-sonnet-4-20250514",
-  "claude-sonnet-4-5": "claude-sonnet-4-20250514",
-  "claude-haiku-4-5": "claude-haiku-4-20250414",
-  // 常见别名
-  "claude-4-opus": "claude-opus-4-20250918",
-  "claude-4-sonnet": "claude-sonnet-4-20250514",
-};
-
-/** 将模型名映射为 Anthropic 官方模型名，未匹配则原样返回 */
-const mapAnthropicModel = (m) => ANTHROPIC_MODEL_MAP[m] || m;
+const mapAnthropicModel = (m) => m;
 
 // ─────────────────────────────────────────────────────────
 //  日志工具
@@ -1064,7 +1050,7 @@ createServer(async (req, res) => {
   );
   console.log(`========================================`);
   console.log(`  Anthropic 原生 API 透传 (Claude Code 等):`);
-  console.log(`  模型名映射: ${Object.keys(ANTHROPIC_MODEL_MAP).join(", ")}`);
+  console.log(`  模型名: 原样透传给上游 API (claude-opus-4-6, claude-sonnet-4-6 等)`);
   console.log(`  ANTHROPIC_BASE_URL=${base.replace("/v1", "")} \\`);
   console.log(`  ANTHROPIC_API_KEY=${KEY} \\`);
   console.log(`  claude`);
