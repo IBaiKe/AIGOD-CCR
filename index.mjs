@@ -67,6 +67,82 @@ function logErr(reqId, ...args) {
   console.error(`[${ts()}] [#${reqId}]`, ...args);
 }
 
+// ─────────────────────────────────────────────────────────
+//  限流器：并发控制 + 响应头退让 + 429 自动重试
+// ─────────────────────────────────────────────────────────
+const MAX_CONCURRENT = 5;       // 最大并发上游请求数
+const MAX_RETRIES = 3;          // 429 最大重试次数
+const DEFAULT_RETRY_DELAY = 5;  // 默认退让秒数（无 retry-after 头时）
+const REMAINING_THRESHOLD = 2;  // 剩余额度低于此值时主动暂停
+
+let activeRequests = 0;
+const waitQueue = [];
+
+function acquireSlot() {
+  if (activeRequests < MAX_CONCURRENT) {
+    activeRequests++;
+    return Promise.resolve();
+  }
+  return new Promise((resolve) => waitQueue.push(resolve));
+}
+
+function releaseSlot() {
+  activeRequests--;
+  if (waitQueue.length > 0) {
+    activeRequests++;
+    waitQueue.shift()();
+  }
+}
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+async function fetchWithRateLimit(url, options, reqId) {
+  await acquireSlot();
+  try {
+    for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+      const resp = await fetch(url, options);
+
+      // ── 429 自动重试 ──
+      if (resp.status === 429) {
+        const retryAfter = parseInt(
+          resp.headers.get("retry-after") || DEFAULT_RETRY_DELAY,
+          10,
+        );
+        const delay = Math.max(retryAfter, 1) * 1000;
+        log(
+          reqId,
+          `  429 rate limited, retry ${attempt + 1}/${MAX_RETRIES} after ${retryAfter}s`,
+        );
+        if (attempt < MAX_RETRIES) {
+          await sleep(delay);
+          continue;
+        }
+        return resp;
+      }
+
+      // ── 被动限速：剩余额度过低时主动暂停 ──
+      const remaining = resp.headers.get("x-ratelimit-remaining-requests");
+      if (remaining !== null) {
+        const rem = parseInt(remaining, 10);
+        if (rem <= REMAINING_THRESHOLD) {
+          const resetHeader =
+            resp.headers.get("retry-after") ||
+            resp.headers.get("x-ratelimit-reset");
+          const pauseSec = resetHeader
+            ? parseInt(resetHeader, 10)
+            : DEFAULT_RETRY_DELAY;
+          log(reqId, `  remaining=${rem}, pausing ${pauseSec}s`);
+          await sleep(pauseSec * 1000);
+        }
+      }
+
+      return resp;
+    }
+  } finally {
+    releaseSlot();
+  }
+}
+
 const creds = (p) => {
   const P = p.toUpperCase();
   return {
@@ -715,14 +791,14 @@ createServer(async (req, res) => {
       // ═══════════════════════════════════════════════════
       if (prov === "openai" || prov === "openrouter") {
         log(reqId, `  → upstream ${prov} ${url}/chat/completions`);
-        const up = await fetch(`${url}/chat/completions`, {
+        const up = await fetchWithRateLimit(`${url}/chat/completions`, {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
             Authorization: `Bearer ${key}`,
           },
           body: raw,
-        });
+        }, reqId);
         log(reqId, `  ← upstream ${up.status}`);
         if (p.stream) {
           log(
@@ -807,7 +883,7 @@ createServer(async (req, res) => {
           reqId,
           `  → upstream anthropic ${url}/messages (model=${mappedModel})`,
         );
-        const up = await fetch(`${url}/messages`, {
+        const up = await fetchWithRateLimit(`${url}/messages`, {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
@@ -815,7 +891,7 @@ createServer(async (req, res) => {
             "anthropic-version": "2023-06-01",
           },
           body: JSON.stringify(anthropicBody),
-        });
+        }, reqId);
 
         log(reqId, `  ← upstream ${up.status}`);
         if (!up.ok) {
@@ -870,7 +946,7 @@ createServer(async (req, res) => {
         const action = p.stream
           ? "streamGenerateContent?alt=sse"
           : "generateContent";
-        const up = await fetch(`${url}/models/${p.model}:${action}`, {
+        const up = await fetchWithRateLimit(`${url}/models/${p.model}:${action}`, {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
@@ -885,7 +961,7 @@ createServer(async (req, res) => {
               maxOutputTokens: p.max_tokens || 8192,
             },
           }),
-        });
+        }, reqId);
         log(reqId, `  ← upstream ${up.status}`);
         if (!up.ok) {
           const errResp = await up
@@ -1014,11 +1090,11 @@ createServer(async (req, res) => {
       );
       // 用修改后的 body（模型名已映射）
       const upBody = JSON.stringify(p);
-      const up = await fetch(upstreamUrl, {
+      const up = await fetchWithRateLimit(upstreamUrl, {
         method: "POST",
         headers: fwdHeaders,
         body: upBody,
-      });
+      }, reqId);
 
       log(reqId, `  ← upstream ${up.status}`);
 
