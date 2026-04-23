@@ -1,10 +1,11 @@
 # Replit AI Proxy — OpenAI Compatible API Gateway
 
-零依赖 Node.js 18+ AI 代理服务，对外完全兼容 OpenAI Chat Completions API，同时支持 Anthropic 原生 `/v1/messages` 端点透传（可直接用于 Claude Code 等原生客户端）。内部自动路由到 Anthropic Claude / OpenAI / Google Gemini / OpenRouter，并在 Claude 场景下实现完整的 tool calling 双向协议转换。
+零依赖 Node.js 18+ AI 代理服务，对外完全兼容 OpenAI Chat Completions API 和 Responses API，同时支持 Anthropic 原生 `/v1/messages` 端点透传。内部自动路由到 Anthropic Claude / OpenAI / Google Gemini / OpenRouter，并在 Claude 场景下实现完整的 tool calling 双向协议转换。
 
 ## 特性
 
-- **OpenAI API 兼容**：客户端使用标准 OpenAI SDK 即可调用所有支持的模型
+- **OpenAI Chat Completions API 兼容**：客户端使用标准 OpenAI SDK 即可调用所有支持的模型
+- **OpenAI Responses API 支持**：支持 `/v1/responses` 端点，兼容 Codex CLI 等新一代 OpenAI 客户端
 - **Anthropic 原生 API 透传**：支持 `/v1/messages` 端点，可直接用于 Claude Code、Anthropic SDK 等原生客户端
 - **多模型路由**：自动根据模型名称路由到对应后端（Anthropic / OpenAI / Gemini / OpenRouter）
 - **Claude Tool Calling 双向转换**：完整实现 OpenAI `tools/tool_calls` ↔ Anthropic `tool_use/tool_result` 协议映射
@@ -16,7 +17,7 @@
 
 | Provider | 模型 |
 |----------|------|
-| Anthropic | claude-opus-4-6, claude-opus-4-5, claude-opus-4-1, claude-sonnet-4-6, claude-sonnet-4-5, claude-haiku-4-5 |
+| Anthropic | claude-opus-4-7, claude-opus-4-6, claude-opus-4-5, claude-opus-4-1, claude-sonnet-4-6, claude-sonnet-4-5, claude-haiku-4-5 |
 | OpenAI | gpt-5.2, gpt-5.1, gpt-5, gpt-5-mini, gpt-5-nano, gpt-4.1, gpt-4.1-mini, gpt-4.1-nano, gpt-4o, gpt-4o-mini, o4-mini, o3, o3-mini |
 | Gemini | gemini-3.1-pro-preview, gemini-3-pro-preview, gemini-3-flash-preview, gemini-2.5-pro, gemini-2.5-flash |
 | OpenRouter | 任何包含 `/` 的模型标识 |
@@ -50,6 +51,32 @@
 ### `GET /v1/models`
 
 列出所有可用模型。
+
+### `POST /v1/responses`
+
+OpenAI Responses API 端点，兼容 Codex CLI 等新一代 OpenAI 客户端。
+
+支持参数：
+
+- `model` — 模型名称
+- `input` — 输入内容（字符串或 item 数组）
+- `instructions` — 系统指令（对应 Anthropic 的 system 字段）
+- `stream` — 是否流式返回
+- `tools` — 工具定义（仅支持 `function` 类型，内置工具如 `web_search` 会被静默忽略）
+- `tool_choice` — 工具选择策略
+- `temperature` / `top_p` / `max_output_tokens` / `stop` — 生成参数
+
+支持的 input item 类型：
+
+| 类型 | 说明 |
+|------|------|
+| 字符串 | 自动作为 user message |
+| `{role, content}` | EasyInputMessage，`developer` 角色映射为 system |
+| `{type: "message", role, content}` | 完整 message item |
+| `{type: "function_call", call_id, name, arguments}` | 模型发出的工具调用 |
+| `{type: "function_call_output", call_id, output}` | 工具执行结果 |
+
+**注意**：`previous_response_id` 不支持，客户端需每次发送完整 input 历史。
 
 ### `POST /v1/messages`
 
@@ -110,6 +137,69 @@ claude
 - Claude Code 会使用 Anthropic 官方模型名（如 `claude-sonnet-4-20250514`），代理会原样透传给后端
 - 代理同时支持 `x-api-key` 和 `Authorization: Bearer` 两种认证方式，完全兼容 Claude Code 的认证机制
 - 流式和非流式请求均会原样透传，不做任何格式转换
+
+## 在 Codex CLI 中使用
+
+本代理支持 OpenAI Responses API（`/v1/responses`），因此可以配合 Codex CLI 使用 Claude 模型。
+
+### 配置方法
+
+```bash
+# Linux / macOS
+export OPENAI_BASE_URL=https://YOUR-REPLIT-DOMAIN/v1
+export OPENAI_API_KEY=YOUR-PROXY-KEY
+codex --model claude-opus-4-7
+
+# Windows (PowerShell)
+$env:OPENAI_BASE_URL = "https://YOUR-REPLIT-DOMAIN/v1"
+$env:OPENAI_API_KEY = "YOUR-PROXY-KEY"
+codex --model claude-opus-4-7
+
+# Windows (CMD)
+set OPENAI_BASE_URL=https://YOUR-REPLIT-DOMAIN/v1
+set OPENAI_API_KEY=YOUR-PROXY-KEY
+codex --model claude-opus-4-7
+```
+
+代理会自动将 Codex CLI 的 Responses API 请求转换为 Anthropic Messages API 格式，包括流式 tool calling 的完整事件映射。
+
+## Responses API ↔ Anthropic 协议转换说明
+
+### 请求方向：Responses API → Anthropic
+
+| Responses API 格式 | Anthropic 格式 |
+|-------------------|---------------|
+| `instructions` | 顶层 `system` 字段 |
+| `input` (string) | `messages: [{role: "user", content}]` |
+| `input` (role=developer) | 合并到 `system` 字段 |
+| `input` (type=function_call) | `content: [{type: "tool_use", id, name, input}]` |
+| `input` (type=function_call_output) | `content: [{type: "tool_result", tool_use_id, content}]` |
+| `max_output_tokens` | `max_tokens` |
+| `tools` (type=function) | `tools[].{name, description, input_schema}` |
+| `tools` (type=web_search 等) | 静默忽略 |
+
+### 响应方向：Anthropic → Responses API
+
+| Anthropic 格式 | Responses API 格式 |
+|---------------|-------------------|
+| `content[type=text]` | `output: [{type: "message", content: [{type: "output_text", text}]}]` |
+| `content[type=tool_use]` | `output: [{type: "function_call", call_id, name, arguments}]` |
+| `stop_reason: "end_turn"` | `status: "completed"` |
+| `stop_reason: "tool_use"` | `status: "completed"` |
+| `stop_reason: "max_tokens"` | `status: "incomplete"`, `reason: "max_output_tokens"` |
+
+### 流式事件映射（Anthropic SSE → Responses API SSE）
+
+| Anthropic SSE 事件 | Responses API SSE 事件 |
+|-------------------|----------------------|
+| `message_start` | `response.created` |
+| `content_block_start` (text) | `response.output_item.added` + `response.content_part.added` |
+| `content_block_delta` (text_delta) | `response.output_text.delta` |
+| `content_block_stop` (text) | `response.output_text.done` + `response.output_item.done` |
+| `content_block_start` (tool_use) | `response.output_item.added` (function_call) |
+| `content_block_delta` (input_json_delta) | `response.function_call_arguments.delta` |
+| `content_block_stop` (tool_use) | `response.function_call_arguments.done` + `response.output_item.done` |
+| `message_stop` | `response.completed` |
 
 ## Claude Tool Calling 协议转换说明
 
@@ -281,12 +371,14 @@ const result = await generateText({
 
 ```
 rep-ccgod/
-├── index.mjs       # 主服务文件（全部逻辑）
-├── package.json     # Node.js 包配置
-├── .replit          # Replit 运行配置
-├── replit.nix       # Nix 环境配置
-├── aigod-cc.md      # 原始需求文档
-└── README.md        # 本文件
+├── index.mjs            # 主服务文件（全部逻辑）
+├── test-conversion.mjs  # 协议转换离线测试
+├── package.json         # Node.js 包配置
+├── .replit              # Replit 运行配置
+├── replit.nix           # Nix 环境配置
+├── doc/
+│   └── aigod-cc.md      # 原始需求文档
+└── README.md            # 本文件
 ```
 
 ## 认证

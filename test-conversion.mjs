@@ -911,6 +911,435 @@ console.log(
 }
 
 // ═══════════════════════════════════════════════════════════
+//  Responses API 转换函数（与 index.mjs 保持一致）
+// ═══════════════════════════════════════════════════════════
+
+const respId = () => "resp_" + randomBytes(8).toString("hex");
+const msgItemId = () => "msg_" + randomBytes(8).toString("hex");
+const fcItemId = () => "fc_" + randomBytes(8).toString("hex");
+
+function convertResponsesInputToMessages(input, instructions) {
+  const messages = [];
+  if (instructions) {
+    messages.push({ role: "system", content: instructions });
+  }
+  if (typeof input === "string") {
+    messages.push({ role: "user", content: input });
+    return messages;
+  }
+  if (!Array.isArray(input)) {
+    messages.push({ role: "user", content: String(input) });
+    return messages;
+  }
+  for (const item of input) {
+    if (item.type === "message") {
+      const role = item.role === "developer" ? "system" : item.role;
+      messages.push({ role, content: item.content });
+      continue;
+    }
+    if (item.type === "function_call") {
+      messages.push({
+        role: "assistant",
+        content: null,
+        tool_calls: [
+          {
+            id: item.call_id || item.id,
+            type: "function",
+            function: { name: item.name, arguments: item.arguments || "{}" },
+          },
+        ],
+      });
+      continue;
+    }
+    if (item.type === "function_call_output") {
+      messages.push({
+        role: "tool",
+        tool_call_id: item.call_id,
+        content: item.output || "",
+      });
+      continue;
+    }
+    if (item.role) {
+      const role = item.role === "developer" ? "system" : item.role;
+      messages.push({ role, content: item.content });
+      continue;
+    }
+  }
+  return messages;
+}
+
+function filterResponsesTools(tools) {
+  if (!tools || !Array.isArray(tools)) return undefined;
+  const filtered = tools.filter((t) => t.type === "function");
+  return filtered.length > 0 ? filtered : undefined;
+}
+
+function convertAnthropicResponseToResponses(data, model) {
+  const output = [];
+  const textParts = [];
+  if (data.content && Array.isArray(data.content)) {
+    for (const block of data.content) {
+      if (block.type === "text") textParts.push(block.text);
+    }
+    if (textParts.length > 0) {
+      output.push({
+        type: "message",
+        id: msgItemId(),
+        role: "assistant",
+        status: "completed",
+        content: [{ type: "output_text", text: textParts.join("") }],
+      });
+    }
+    for (const block of data.content) {
+      if (block.type === "tool_use") {
+        output.push({
+          type: "function_call",
+          id: fcItemId(),
+          call_id: block.id || tcid(),
+          name: block.name,
+          arguments:
+            typeof block.input === "string"
+              ? block.input
+              : JSON.stringify(block.input || {}),
+          status: "completed",
+        });
+      }
+    }
+  }
+  const resp = {
+    id: respId(),
+    object: "response",
+    created_at: Math.floor(Date.now() / 1000),
+    model,
+    status: "completed",
+    output,
+    usage: {
+      input_tokens: data.usage?.input_tokens || 0,
+      output_tokens: data.usage?.output_tokens || 0,
+      total_tokens:
+        (data.usage?.input_tokens || 0) + (data.usage?.output_tokens || 0),
+    },
+  };
+  if (data.stop_reason === "max_tokens") {
+    resp.status = "incomplete";
+    resp.incomplete_details = { reason: "max_output_tokens" };
+  }
+  return resp;
+}
+
+// ═══════════════════════════════════════════════════════════
+//  TEST 14: Responses input (string) → messages
+// ═══════════════════════════════════════════════════════════
+console.log(
+  "\n🔧 Test 14: convertResponsesInputToMessages - string input",
+);
+{
+  const result = convertResponsesInputToMessages("Hello world", null);
+  assert(result.length === 1, "Single user message");
+  assert(result[0].role === "user", "Role is user");
+  assert(result[0].content === "Hello world", "Content preserved");
+}
+
+// ═══════════════════════════════════════════════════════════
+//  TEST 15: Responses input (string) with instructions
+// ═══════════════════════════════════════════════════════════
+console.log(
+  "\n🔧 Test 15: convertResponsesInputToMessages - string + instructions",
+);
+{
+  const result = convertResponsesInputToMessages("Hello", "Be concise.");
+  assert(result.length === 2, "System + user messages");
+  assert(result[0].role === "system", "First is system");
+  assert(result[0].content === "Be concise.", "Instructions preserved");
+  assert(result[1].role === "user", "Second is user");
+  assert(result[1].content === "Hello", "Input preserved");
+}
+
+// ═══════════════════════════════════════════════════════════
+//  TEST 16: Responses input (EasyInputMessage array)
+// ═══════════════════════════════════════════════════════════
+console.log(
+  "\n🔧 Test 16: convertResponsesInputToMessages - EasyInputMessage array",
+);
+{
+  const input = [
+    { role: "developer", content: "System rules" },
+    { role: "user", content: "Hi" },
+    { role: "assistant", content: "Hello!" },
+    { role: "user", content: "How are you?" },
+  ];
+  const result = convertResponsesInputToMessages(input, null);
+  assert(result.length === 4, "4 messages");
+  assert(result[0].role === "system", "developer → system");
+  assert(result[0].content === "System rules", "developer content");
+  assert(result[1].role === "user", "user role");
+  assert(result[2].role === "assistant", "assistant role");
+  assert(result[3].role === "user", "second user");
+}
+
+// ═══════════════════════════════════════════════════════════
+//  TEST 17: Responses input with function_call + output
+// ═══════════════════════════════════════════════════════════
+console.log(
+  "\n🔧 Test 17: convertResponsesInputToMessages - function_call round trip",
+);
+{
+  const input = [
+    { role: "user", content: "What is the weather?" },
+    {
+      type: "function_call",
+      id: "fc_001",
+      call_id: "call_abc",
+      name: "get_weather",
+      arguments: '{"location":"Tokyo"}',
+    },
+    {
+      type: "function_call_output",
+      call_id: "call_abc",
+      output: '{"temp":22}',
+    },
+  ];
+  const result = convertResponsesInputToMessages(input, null);
+  assert(result.length === 3, "3 messages (user, assistant, tool)");
+  assert(result[1].role === "assistant", "function_call → assistant");
+  assert(result[1].tool_calls[0].id === "call_abc", "call_id used as id");
+  assert(
+    result[1].tool_calls[0].function.name === "get_weather",
+    "function name",
+  );
+  assert(
+    result[1].tool_calls[0].function.arguments === '{"location":"Tokyo"}',
+    "arguments preserved",
+  );
+  assert(result[2].role === "tool", "function_call_output → tool");
+  assert(result[2].tool_call_id === "call_abc", "tool_call_id = call_id");
+  assert(result[2].content === '{"temp":22}', "output preserved");
+}
+
+// ═══════════════════════════════════════════════════════════
+//  TEST 18: Responses input with type: "message" items
+// ═══════════════════════════════════════════════════════════
+console.log(
+  "\n🔧 Test 18: convertResponsesInputToMessages - typed message items",
+);
+{
+  const input = [
+    { type: "message", role: "developer", content: "Be helpful" },
+    { type: "message", role: "user", content: "Hi" },
+  ];
+  const result = convertResponsesInputToMessages(input, null);
+  assert(result.length === 2, "2 messages");
+  assert(result[0].role === "system", "developer → system");
+  assert(result[1].role === "user", "user preserved");
+}
+
+// ═══════════════════════════════════════════════════════════
+//  TEST 19: filterResponsesTools
+// ═══════════════════════════════════════════════════════════
+console.log("\n🔧 Test 19: filterResponsesTools");
+{
+  const tools = [
+    { type: "function", function: { name: "get_weather" } },
+    { type: "web_search" },
+    { type: "function", function: { name: "search" } },
+    { type: "code_interpreter" },
+  ];
+  const result = filterResponsesTools(tools);
+  assert(result.length === 2, "Only function tools kept");
+  assert(result[0].function.name === "get_weather", "First function tool");
+  assert(result[1].function.name === "search", "Second function tool");
+
+  assert(filterResponsesTools(null) === undefined, "null → undefined");
+  assert(
+    filterResponsesTools([{ type: "web_search" }]) === undefined,
+    "No function tools → undefined",
+  );
+}
+
+// ═══════════════════════════════════════════════════════════
+//  TEST 20: Anthropic response → Responses API (text only)
+// ═══════════════════════════════════════════════════════════
+console.log(
+  "\n🔧 Test 20: convertAnthropicResponseToResponses - text only",
+);
+{
+  const data = {
+    content: [{ type: "text", text: "Hello!" }],
+    stop_reason: "end_turn",
+    usage: { input_tokens: 10, output_tokens: 5 },
+  };
+  const result = convertAnthropicResponseToResponses(data, "claude-opus-4-7");
+  assert(result.object === "response", 'object = "response"');
+  assert(result.model === "claude-opus-4-7", "model preserved");
+  assert(result.status === "completed", "status = completed");
+  assert(result.output.length === 1, "1 output item");
+  assert(result.output[0].type === "message", "output is message");
+  assert(result.output[0].role === "assistant", "role = assistant");
+  assert(
+    result.output[0].content[0].type === "output_text",
+    "content type = output_text",
+  );
+  assert(result.output[0].content[0].text === "Hello!", "text preserved");
+  assert(result.usage.input_tokens === 10, "input_tokens");
+  assert(result.usage.output_tokens === 5, "output_tokens");
+  assert(result.usage.total_tokens === 15, "total_tokens");
+}
+
+// ═══════════════════════════════════════════════════════════
+//  TEST 21: Anthropic response → Responses API (tool_use)
+// ═══════════════════════════════════════════════════════════
+console.log(
+  "\n🔧 Test 21: convertAnthropicResponseToResponses - tool_use",
+);
+{
+  const data = {
+    content: [
+      { type: "text", text: "Let me check." },
+      {
+        type: "tool_use",
+        id: "toolu_abc",
+        name: "get_weather",
+        input: { location: "Tokyo" },
+      },
+    ],
+    stop_reason: "tool_use",
+    usage: { input_tokens: 50, output_tokens: 30 },
+  };
+  const result = convertAnthropicResponseToResponses(data, "claude-sonnet-4-6");
+  assert(result.status === "completed", "status = completed (tool_use)");
+  assert(result.output.length === 2, "2 output items (message + function_call)");
+  assert(result.output[0].type === "message", "first is message");
+  assert(result.output[0].content[0].text === "Let me check.", "text preserved");
+  assert(result.output[1].type === "function_call", "second is function_call");
+  assert(result.output[1].call_id === "toolu_abc", "call_id = block.id");
+  assert(result.output[1].name === "get_weather", "function name");
+  assert(
+    result.output[1].arguments === '{"location":"Tokyo"}',
+    "arguments as JSON string",
+  );
+  assert(result.output[1].status === "completed", "function_call completed");
+}
+
+// ═══════════════════════════════════════════════════════════
+//  TEST 22: Anthropic response → Responses API (max_tokens)
+// ═══════════════════════════════════════════════════════════
+console.log(
+  "\n🔧 Test 22: convertAnthropicResponseToResponses - max_tokens → incomplete",
+);
+{
+  const data = {
+    content: [{ type: "text", text: "Truncated..." }],
+    stop_reason: "max_tokens",
+    usage: { input_tokens: 10, output_tokens: 100 },
+  };
+  const result = convertAnthropicResponseToResponses(data, "claude-sonnet-4-6");
+  assert(result.status === "incomplete", "status = incomplete");
+  assert(
+    result.incomplete_details.reason === "max_output_tokens",
+    "reason = max_output_tokens",
+  );
+}
+
+// ═══════════════════════════════════════════════════════════
+//  TEST 23: Full Responses API round-trip (input → Anthropic → response)
+// ═══════════════════════════════════════════════════════════
+console.log(
+  "\n🔧 Test 23: Full Responses API round-trip simulation",
+);
+{
+  // Step 1: Responses API 请求 → messages → Anthropic 格式
+  const responsesInput = [
+    { role: "user", content: "What's the weather in Paris?" },
+  ];
+  const responsesTools = [
+    {
+      type: "function",
+      function: {
+        name: "get_weather",
+        description: "Get weather",
+        parameters: {
+          type: "object",
+          properties: { city: { type: "string" } },
+          required: ["city"],
+        },
+      },
+    },
+    { type: "web_search" },
+  ];
+
+  const chatMessages = convertResponsesInputToMessages(
+    responsesInput,
+    "You are a weather assistant.",
+  );
+  const chatTools = filterResponsesTools(responsesTools);
+
+  assert(chatMessages.length === 2, "RT: system + user messages");
+  assert(chatMessages[0].role === "system", "RT: system from instructions");
+  assert(chatTools.length === 1, "RT: web_search filtered out");
+  assert(chatTools[0].function.name === "get_weather", "RT: function tool kept");
+
+  // 转为 Anthropic 格式
+  const { system, messages } = convertMessagesToAnthropic(chatMessages);
+  assert(system === "You are a weather assistant.", "RT: system extracted");
+  assert(messages.length === 1, "RT: 1 user message");
+
+  const anthropicTools = convertToolsToAnthropic(chatTools);
+  assert(anthropicTools[0].name === "get_weather", "RT: tool converted");
+
+  // Step 2: Anthropic 返回 tool_use → Responses API 格式
+  const claudeResponse = {
+    content: [
+      { type: "text", text: "Let me check Paris." },
+      {
+        type: "tool_use",
+        id: "toolu_paris",
+        name: "get_weather",
+        input: { city: "Paris" },
+      },
+    ],
+    stop_reason: "tool_use",
+    usage: { input_tokens: 80, output_tokens: 40 },
+  };
+
+  const responsesOutput = convertAnthropicResponseToResponses(
+    claudeResponse,
+    "claude-opus-4-7",
+  );
+  assert(responsesOutput.object === "response", "RT: object = response");
+  assert(responsesOutput.output.length === 2, "RT: message + function_call");
+  assert(
+    responsesOutput.output[0].content[0].text === "Let me check Paris.",
+    "RT: text preserved",
+  );
+  assert(responsesOutput.output[1].type === "function_call", "RT: function_call");
+  assert(responsesOutput.output[1].name === "get_weather", "RT: function name");
+
+  // Step 3: 模拟回传工具结果
+  const followUp = convertResponsesInputToMessages(
+    [
+      { role: "user", content: "What's the weather in Paris?" },
+      {
+        type: "function_call",
+        call_id: "toolu_paris",
+        name: "get_weather",
+        arguments: '{"city":"Paris"}',
+      },
+      {
+        type: "function_call_output",
+        call_id: "toolu_paris",
+        output: '{"temperature": 18}',
+      },
+    ],
+    "You are a weather assistant.",
+  );
+
+  assert(followUp.length === 4, "RT follow-up: system + user + assistant + tool");
+  assert(followUp[2].role === "assistant", "RT follow-up: function_call → assistant");
+  assert(followUp[3].role === "tool", "RT follow-up: function_call_output → tool");
+  assert(followUp[3].tool_call_id === "toolu_paris", "RT follow-up: call_id");
+}
+
+// ═══════════════════════════════════════════════════════════
 //  Summary
 // ═══════════════════════════════════════════════════════════
 console.log(`\n${"═".repeat(50)}`);

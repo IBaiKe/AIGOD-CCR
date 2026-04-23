@@ -173,6 +173,9 @@ const J = (res, s, d) => {
 };
 
 const rid = () => "chatcmpl-" + randomBytes(4).toString("hex");
+const respId = () => "resp_" + randomBytes(8).toString("hex");
+const msgItemId = () => "msg_" + randomBytes(8).toString("hex");
+const fcItemId = () => "fc_" + randomBytes(8).toString("hex");
 const tcid = () => "call_" + randomBytes(8).toString("hex");
 const now = () => (Date.now() / 1000) | 0;
 
@@ -624,6 +627,529 @@ async function streamAnthropicWithTools(reader, res, model) {
 }
 
 // ─────────────────────────────────────────────────────────
+//  OpenAI Responses API input → OpenAI chat/completions messages
+//  将 /v1/responses 的 input 格式标准化为 messages 数组
+//  再复用 convertMessagesToAnthropic() 完成最终转换
+// ─────────────────────────────────────────────────────────
+function convertResponsesInputToMessages(input, instructions) {
+  const messages = [];
+
+  // instructions → system message（置顶）
+  if (instructions) {
+    messages.push({ role: "system", content: instructions });
+  }
+
+  // input 为纯字符串 → 单条 user message
+  if (typeof input === "string") {
+    messages.push({ role: "user", content: input });
+    return messages;
+  }
+
+  if (!Array.isArray(input)) {
+    messages.push({ role: "user", content: String(input) });
+    return messages;
+  }
+
+  for (const item of input) {
+    // ── 有 type 字段的完整 item ──
+    if (item.type === "message") {
+      const role = item.role === "developer" ? "system" : item.role;
+      messages.push({ role, content: item.content });
+      continue;
+    }
+
+    if (item.type === "function_call") {
+      messages.push({
+        role: "assistant",
+        content: null,
+        tool_calls: [
+          {
+            id: item.call_id || item.id,
+            type: "function",
+            function: {
+              name: item.name,
+              arguments: item.arguments || "{}",
+            },
+          },
+        ],
+      });
+      continue;
+    }
+
+    if (item.type === "function_call_output") {
+      messages.push({
+        role: "tool",
+        tool_call_id: item.call_id,
+        content: item.output || "",
+      });
+      continue;
+    }
+
+    // ── EasyInputMessage（无 type，有 role） ──
+    if (item.role) {
+      const role = item.role === "developer" ? "system" : item.role;
+      messages.push({ role, content: item.content });
+      continue;
+    }
+
+    // ── 忽略 item_reference 等未知类型 ──
+  }
+
+  return messages;
+}
+
+// ─────────────────────────────────────────────────────────
+//  Responses API tools → chat/completions tools
+//  过滤内置工具（web_search / file_search / code_interpreter）
+//  只保留 function 类型
+// ─────────────────────────────────────────────────────────
+function filterResponsesTools(tools) {
+  if (!tools || !Array.isArray(tools)) return undefined;
+  const filtered = tools.filter((t) => t.type === "function");
+  return filtered.length > 0 ? filtered : undefined;
+}
+
+// ─────────────────────────────────────────────────────────
+//  Anthropic response → OpenAI Responses API 格式 (非流式)
+// ─────────────────────────────────────────────────────────
+function convertAnthropicResponseToResponses(data, model) {
+  const output = [];
+  const textParts = [];
+
+  if (data.content && Array.isArray(data.content)) {
+    // 先收集所有文本，合并为单个 message item
+    for (const block of data.content) {
+      if (block.type === "text") {
+        textParts.push(block.text);
+      }
+    }
+
+    if (textParts.length > 0) {
+      output.push({
+        type: "message",
+        id: msgItemId(),
+        role: "assistant",
+        status: "completed",
+        content: [{ type: "output_text", text: textParts.join("") }],
+      });
+    }
+
+    // 每个 tool_use 独立为一个 function_call item
+    for (const block of data.content) {
+      if (block.type === "tool_use") {
+        output.push({
+          type: "function_call",
+          id: fcItemId(),
+          call_id: block.id || tcid(),
+          name: block.name,
+          arguments:
+            typeof block.input === "string"
+              ? block.input
+              : JSON.stringify(block.input || {}),
+          status: "completed",
+        });
+      }
+    }
+  }
+
+  let status = "completed";
+  const resp = {
+    id: respId(),
+    object: "response",
+    created_at: now(),
+    model,
+    status,
+    output,
+    usage: {
+      input_tokens: data.usage?.input_tokens || 0,
+      output_tokens: data.usage?.output_tokens || 0,
+      total_tokens:
+        (data.usage?.input_tokens || 0) + (data.usage?.output_tokens || 0),
+    },
+  };
+
+  if (data.stop_reason === "max_tokens") {
+    resp.status = "incomplete";
+    resp.incomplete_details = { reason: "max_output_tokens" };
+  }
+
+  return resp;
+}
+
+// ─────────────────────────────────────────────────────────
+//  Anthropic SSE stream → OpenAI Responses API SSE stream
+//  语义化事件模型：event: xxx\ndata: {...}\n\n
+// ─────────────────────────────────────────────────────────
+async function streamAnthropicToResponses(reader, res, model) {
+  const dec = new TextDecoder();
+  const id = respId();
+  let buf = "";
+
+  // ── 状态跟踪 ──
+  let outputIndex = -1;
+  let usage = { input_tokens: 0, output_tokens: 0, total_tokens: 0 };
+  let stopReason = null;
+
+  // 累积完整值（用于 done 事件）
+  const outputItems = [];   // 完成的 output items
+  const activeText = {};    // key=outputIndex → 累积文本
+  const activeArgs = {};    // key=outputIndex → 累积参数 JSON
+  const blockTypes = {};    // key=anthropic block index → "text" | "tool_use"
+  const blockMeta = {};     // key=anthropic block index → {id, name, callId, outputIndex}
+
+  // ── 是否已有 message item（文本块合并到同一个 message） ──
+  let messageItemIndex = -1;
+  let messageItemId = null;
+
+  const emit = (event, data) => {
+    res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+  };
+
+  res.writeHead(200, {
+    "Content-Type": "text/event-stream",
+    "Cache-Control": "no-cache",
+    Connection: "keep-alive",
+  });
+
+  // response.created
+  emit("response.created", {
+    id,
+    object: "response",
+    created_at: now(),
+    model,
+    status: "in_progress",
+    output: [],
+    usage,
+  });
+
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += dec.decode(value, { stream: true });
+    const lines = buf.split("\n");
+    buf = lines.pop();
+
+    for (const line of lines) {
+      if (!line.startsWith("data: ")) continue;
+      const raw = line.slice(6).trim();
+      if (!raw || raw === "[DONE]") continue;
+
+      let event;
+      try {
+        event = JSON.parse(raw);
+      } catch {
+        continue;
+      }
+
+      switch (event.type) {
+        case "message_start": {
+          if (event.message?.usage) {
+            usage.input_tokens = event.message.usage.input_tokens || 0;
+            usage.output_tokens = event.message.usage.output_tokens || 0;
+            usage.total_tokens = usage.input_tokens + usage.output_tokens;
+          }
+          break;
+        }
+
+        case "content_block_start": {
+          const block = event.content_block;
+          if (!block) break;
+
+          if (block.type === "text") {
+            blockTypes[event.index] = "text";
+
+            // 所有文本块合并到同一个 message item
+            if (messageItemIndex === -1) {
+              outputIndex++;
+              messageItemIndex = outputIndex;
+              messageItemId = msgItemId();
+              activeText[messageItemIndex] = "";
+
+              emit("response.output_item.added", {
+                output_index: messageItemIndex,
+                item: {
+                  type: "message",
+                  id: messageItemId,
+                  role: "assistant",
+                  status: "in_progress",
+                  content: [],
+                },
+              });
+            }
+
+            blockMeta[event.index] = {
+              outputIndex: messageItemIndex,
+              contentIndex: (activeText[messageItemIndex] === "" ? 0 : 0),
+            };
+
+            emit("response.content_part.added", {
+              output_index: messageItemIndex,
+              content_index: 0,
+              part: { type: "output_text", text: "" },
+            });
+          } else if (block.type === "tool_use") {
+            outputIndex++;
+            blockTypes[event.index] = "tool_use";
+            const callId = block.id || tcid();
+
+            blockMeta[event.index] = {
+              outputIndex,
+              id: fcItemId(),
+              callId,
+              name: block.name,
+            };
+            activeArgs[outputIndex] = "";
+
+            emit("response.output_item.added", {
+              output_index: outputIndex,
+              item: {
+                type: "function_call",
+                id: blockMeta[event.index].id,
+                call_id: callId,
+                name: block.name,
+                arguments: "",
+                status: "in_progress",
+              },
+            });
+          }
+          break;
+        }
+
+        case "content_block_delta": {
+          const delta = event.delta;
+          if (!delta) break;
+
+          if (delta.type === "text_delta" && delta.text) {
+            const meta = blockMeta[event.index];
+            if (meta) {
+              activeText[meta.outputIndex] =
+                (activeText[meta.outputIndex] || "") + delta.text;
+              emit("response.output_text.delta", {
+                output_index: meta.outputIndex,
+                content_index: 0,
+                delta: delta.text,
+              });
+            }
+          } else if (
+            delta.type === "input_json_delta" &&
+            delta.partial_json !== undefined
+          ) {
+            const meta = blockMeta[event.index];
+            if (meta) {
+              activeArgs[meta.outputIndex] =
+                (activeArgs[meta.outputIndex] || "") + delta.partial_json;
+              emit("response.function_call_arguments.delta", {
+                output_index: meta.outputIndex,
+                delta: delta.partial_json,
+              });
+            }
+          }
+          break;
+        }
+
+        case "content_block_stop": {
+          const bType = blockTypes[event.index];
+          const meta = blockMeta[event.index];
+          if (!meta) break;
+
+          if (bType === "text") {
+            const fullText = activeText[meta.outputIndex] || "";
+            emit("response.output_text.done", {
+              output_index: meta.outputIndex,
+              content_index: 0,
+              text: fullText,
+            });
+            emit("response.content_part.done", {
+              output_index: meta.outputIndex,
+              content_index: 0,
+              part: { type: "output_text", text: fullText },
+            });
+            emit("response.output_item.done", {
+              output_index: meta.outputIndex,
+              item: {
+                type: "message",
+                id: messageItemId,
+                role: "assistant",
+                status: "completed",
+                content: [{ type: "output_text", text: fullText }],
+              },
+            });
+            outputItems[meta.outputIndex] = {
+              type: "message",
+              id: messageItemId,
+              role: "assistant",
+              status: "completed",
+              content: [{ type: "output_text", text: fullText }],
+            };
+          } else if (bType === "tool_use") {
+            const fullArgs = activeArgs[meta.outputIndex] || "{}";
+            emit("response.function_call_arguments.done", {
+              output_index: meta.outputIndex,
+              arguments: fullArgs,
+            });
+            const fcItem = {
+              type: "function_call",
+              id: meta.id,
+              call_id: meta.callId,
+              name: meta.name,
+              arguments: fullArgs,
+              status: "completed",
+            };
+            emit("response.output_item.done", {
+              output_index: meta.outputIndex,
+              item: fcItem,
+            });
+            outputItems[meta.outputIndex] = fcItem;
+          }
+          break;
+        }
+
+        case "message_delta": {
+          if (event.delta?.stop_reason) {
+            stopReason = event.delta.stop_reason;
+          }
+          if (event.usage) {
+            usage.output_tokens = event.usage.output_tokens || usage.output_tokens;
+            usage.total_tokens = usage.input_tokens + usage.output_tokens;
+          }
+          break;
+        }
+
+        case "message_stop": {
+          break;
+        }
+
+        case "ping":
+          break;
+
+        case "error": {
+          const errMsg = event.error?.message || "Unknown Anthropic error";
+          emit("error", { error: { type: "server_error", message: errMsg } });
+          break;
+        }
+
+        default:
+          break;
+      }
+    }
+  }
+
+  // response.completed
+  const finalOutput = outputItems.filter(Boolean);
+  const finalStatus = stopReason === "max_tokens" ? "incomplete" : "completed";
+  const completed = {
+    id,
+    object: "response",
+    created_at: now(),
+    model,
+    status: finalStatus,
+    output: finalOutput,
+    usage,
+  };
+  if (finalStatus === "incomplete") {
+    completed.incomplete_details = { reason: "max_output_tokens" };
+  }
+  emit("response.completed", completed);
+  res.end();
+}
+
+// ─────────────────────────────────────────────────────────
+//  Gemini response → OpenAI Responses API 格式 (非流式)
+// ─────────────────────────────────────────────────────────
+function convertGeminiResponseToResponses(data, model) {
+  const text = data.candidates?.[0]?.content?.parts?.[0]?.text || "";
+  return {
+    id: respId(),
+    object: "response",
+    created_at: now(),
+    model,
+    status: "completed",
+    output: [
+      {
+        type: "message",
+        id: msgItemId(),
+        role: "assistant",
+        status: "completed",
+        content: [{ type: "output_text", text }],
+      },
+    ],
+    usage: {
+      input_tokens: data.usageMetadata?.promptTokenCount || 0,
+      output_tokens: data.usageMetadata?.candidatesTokenCount || 0,
+      total_tokens: data.usageMetadata?.totalTokenCount || 0,
+    },
+  };
+}
+
+// ─────────────────────────────────────────────────────────
+//  Gemini SSE stream → OpenAI Responses API SSE stream
+// ─────────────────────────────────────────────────────────
+async function streamGeminiToResponses(reader, res, model) {
+  const dec = new TextDecoder();
+  const id = respId();
+  const mId = msgItemId();
+  let buf = "";
+  let fullText = "";
+
+  res.writeHead(200, {
+    "Content-Type": "text/event-stream",
+    "Cache-Control": "no-cache",
+    Connection: "keep-alive",
+  });
+
+  const emit = (event, data) => {
+    res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+  };
+
+  emit("response.created", {
+    id, object: "response", created_at: now(), model,
+    status: "in_progress", output: [], usage: { input_tokens: 0, output_tokens: 0, total_tokens: 0 },
+  });
+  emit("response.output_item.added", {
+    output_index: 0,
+    item: { type: "message", id: mId, role: "assistant", status: "in_progress", content: [] },
+  });
+  emit("response.content_part.added", {
+    output_index: 0, content_index: 0, part: { type: "output_text", text: "" },
+  });
+
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += dec.decode(value, { stream: true });
+    const lines = buf.split("\n");
+    buf = lines.pop();
+    for (const l of lines) {
+      if (!l.startsWith("data: ")) continue;
+      try {
+        const e = JSON.parse(l.slice(6));
+        const t = e.candidates?.[0]?.content?.parts?.[0]?.text;
+        if (t) {
+          fullText += t;
+          emit("response.output_text.delta", { output_index: 0, content_index: 0, delta: t });
+        }
+      } catch {}
+    }
+  }
+
+  emit("response.output_text.done", { output_index: 0, content_index: 0, text: fullText });
+  emit("response.content_part.done", {
+    output_index: 0, content_index: 0, part: { type: "output_text", text: fullText },
+  });
+  emit("response.output_item.done", {
+    output_index: 0,
+    item: { type: "message", id: mId, role: "assistant", status: "completed", content: [{ type: "output_text", text: fullText }] },
+  });
+  emit("response.completed", {
+    id, object: "response", created_at: now(), model,
+    status: "completed",
+    output: [{ type: "message", id: mId, role: "assistant", status: "completed", content: [{ type: "output_text", text: fullText }] }],
+    usage: { input_tokens: 0, output_tokens: 0, total_tokens: 0 },
+  });
+  res.end();
+}
+
+// ─────────────────────────────────────────────────────────
 //  原有的简单流处理函数 (pipe / streamGemini)
 // ─────────────────────────────────────────────────────────
 const oaiChunk = (id, model, content, finish) =>
@@ -698,29 +1224,16 @@ createServer(async (req, res) => {
     return J(res, 200, {
       status: "ok",
       message: "Replit AI Proxy is running",
-      endpoints: ["/v1/models", "/v1/chat/completions", "/v1/messages"],
+      endpoints: ["/v1/models", "/v1/chat/completions", "/v1/responses", "/v1/messages"],
     });
   }
 
-  // 支持 Bearer token 和 x-api-key 两种认证方式（兼容 Claude Code）
-  const authKey =
-    req.headers.authorization?.replace(/^Bearer\s+/i, "") ||
-    req.headers["x-api-key"];
-  if (authKey !== KEY) {
-    log(
-      reqId,
-      `← 401 Unauthorized (auth method: ${req.headers["x-api-key"] ? "x-api-key" : req.headers.authorization ? "bearer" : "none"})`,
-    );
-    return J(res, 401, {
-      error: { message: "Unauthorized", type: "auth_error" },
-    });
-  }
-
-  // ─── /v1/models ───
+  // ─── /v1/models（无需认证） ───
   if (req.url === "/v1/models") {
     log(reqId, `← 200 models list (${Date.now() - startTime}ms)`);
     const models = [
       // Anthropic
+      { id: "claude-opus-4-7", owned_by: "anthropic" },
       { id: "claude-opus-4-6", owned_by: "anthropic" },
       { id: "claude-opus-4-5", owned_by: "anthropic" },
       { id: "claude-opus-4-1", owned_by: "anthropic" },
@@ -755,6 +1268,20 @@ createServer(async (req, res) => {
         object: "model",
         created: 1700000000,
       })),
+    });
+  }
+
+  // 支持 Bearer token 和 x-api-key 两种认证方式（兼容 Claude Code）
+  const authKey =
+    req.headers.authorization?.replace(/^Bearer\s+/i, "") ||
+    req.headers["x-api-key"];
+  if (authKey !== KEY) {
+    log(
+      reqId,
+      `← 401 Unauthorized (auth method: ${req.headers["x-api-key"] ? "x-api-key" : req.headers.authorization ? "bearer" : "none"})`,
+    );
+    return J(res, 401, {
+      error: { message: "Unauthorized", type: "auth_error" },
     });
   }
 
@@ -1014,6 +1541,199 @@ createServer(async (req, res) => {
   }
 
   // ═══════════════════════════════════════════════════════
+  //  /v1/responses — OpenAI Responses API
+  //  Codex CLI 等新一代 OpenAI 客户端使用此端点
+  // ═══════════════════════════════════════════════════════
+  if (req.url === "/v1/responses" && req.method === "POST") {
+    const raw = await readBody(req);
+    let p;
+    try {
+      p = JSON.parse(raw);
+    } catch {
+      log(reqId, `← 400 Invalid JSON body`);
+      return J(res, 400, {
+        error: { message: "Invalid JSON body", type: "invalid_request_error" },
+      });
+    }
+    const prov = route(p.model);
+    const { url, key } = creds(prov);
+
+    log(
+      reqId,
+      `  [/v1/responses] model=${p.model} provider=${prov} stream=${!!p.stream} input_type=${typeof p.input === "string" ? "string" : "array"}`,
+    );
+
+    if (!url || !key) {
+      log(reqId, `← 500 Missing credentials for ${prov}`);
+      return J(res, 500, {
+        error: {
+          message: `Missing credentials for provider: ${prov}.`,
+          type: "api_error",
+        },
+      });
+    }
+
+    try {
+      // ── OpenAI / OpenRouter：原生透传 ──
+      if (prov === "openai" || prov === "openrouter") {
+        log(reqId, `  → upstream ${prov} ${url}/responses`);
+        const up = await fetchWithRateLimit(`${url}/responses`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${key}`,
+          },
+          body: raw,
+        }, reqId);
+        log(reqId, `  ← upstream ${up.status}`);
+        if (p.stream) {
+          res.writeHead(up.status, {
+            "Content-Type": "text/event-stream",
+            "Cache-Control": "no-cache",
+            Connection: "keep-alive",
+          });
+          return pipe(up.body.getReader(), res);
+        }
+        const respData = await up.json();
+        log(reqId, `← ${up.status} (${Date.now() - startTime}ms)`);
+        return J(res, up.status, respData);
+      }
+
+      // ── Anthropic：完整 Responses API → Anthropic Messages 转换 ──
+      if (prov === "anthropic") {
+        const mappedModel = mapAnthropicModel(p.model);
+
+        // 转换 input → messages → Anthropic 格式
+        const chatTools = filterResponsesTools(p.tools);
+        const chatMessages = convertResponsesInputToMessages(
+          p.input,
+          p.instructions,
+        );
+        const { system, messages } = convertMessagesToAnthropic(chatMessages);
+
+        const anthropicBody = {
+          model: mappedModel,
+          max_tokens: p.max_output_tokens || 8192,
+          messages,
+        };
+
+        if (system) anthropicBody.system = system;
+
+        const anthropicTools = convertToolsToAnthropic(chatTools);
+        if (anthropicTools && anthropicTools.length > 0) {
+          anthropicBody.tools = anthropicTools;
+        }
+
+        if (p.tool_choice !== undefined && anthropicTools) {
+          const tc = convertToolChoiceToAnthropic(p.tool_choice);
+          if (tc) anthropicBody.tool_choice = tc;
+        }
+
+        if (p.stream) anthropicBody.stream = true;
+        if (p.temperature !== undefined) anthropicBody.temperature = p.temperature;
+        if (p.top_p !== undefined) anthropicBody.top_p = p.top_p;
+        if (p.stop) {
+          anthropicBody.stop_sequences = Array.isArray(p.stop)
+            ? p.stop
+            : [p.stop];
+        }
+
+        log(reqId, `  → upstream anthropic ${url}/messages (model=${mappedModel})`);
+        const up = await fetchWithRateLimit(`${url}/messages`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "x-api-key": key,
+            "anthropic-version": "2023-06-01",
+          },
+          body: JSON.stringify(anthropicBody),
+        }, reqId);
+
+        log(reqId, `  ← upstream ${up.status}`);
+        if (!up.ok) {
+          const errBody = await up.json().catch(() => ({
+            error: { message: up.statusText },
+          }));
+          logErr(reqId, `← ${up.status} upstream error:`, JSON.stringify(errBody));
+          return J(res, up.status, errBody);
+        }
+
+        if (p.stream) {
+          log(reqId, `  streaming responses to client (${Date.now() - startTime}ms)`);
+          return streamAnthropicToResponses(up.body.getReader(), res, p.model);
+        }
+
+        const data = await up.json();
+        log(
+          reqId,
+          `← 200 finish_reason=${data.stop_reason} usage=[${data.usage?.input_tokens}/${data.usage?.output_tokens}] (${Date.now() - startTime}ms)`,
+        );
+        return J(res, 200, convertAnthropicResponseToResponses(data, p.model));
+      }
+
+      // ── Gemini：基础转换 ──
+      if (prov === "gemini") {
+        const chatMessages = convertResponsesInputToMessages(
+          p.input,
+          p.instructions,
+        );
+        const sys = chatMessages.find((m) => m.role === "system")?.content;
+        const contents = chatMessages
+          .filter((m) => m.role !== "system")
+          .map((m) => ({
+            role: m.role === "assistant" ? "model" : "user",
+            parts: [
+              {
+                text:
+                  typeof m.content === "string"
+                    ? m.content
+                    : JSON.stringify(m.content),
+              },
+            ],
+          }));
+        const action = p.stream
+          ? "streamGenerateContent?alt=sse"
+          : "generateContent";
+        log(reqId, `  → upstream gemini ${url}/models/${p.model}`);
+        const up = await fetchWithRateLimit(`${url}/models/${p.model}:${action}`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "x-goog-api-key": key,
+          },
+          body: JSON.stringify({
+            contents,
+            ...(sys && {
+              systemInstruction: { parts: [{ text: typeof sys === "string" ? sys : JSON.stringify(sys) }] },
+            }),
+            generationConfig: {
+              maxOutputTokens: p.max_output_tokens || 8192,
+            },
+          }),
+        }, reqId);
+        log(reqId, `  ← upstream ${up.status}`);
+        if (!up.ok) {
+          const errResp = await up.json().catch(() => ({ error: up.statusText }));
+          logErr(reqId, `← ${up.status} upstream error:`, JSON.stringify(errResp));
+          return J(res, up.status, errResp);
+        }
+        if (p.stream) {
+          log(reqId, `  streaming responses to client (${Date.now() - startTime}ms)`);
+          return streamGeminiToResponses(up.body.getReader(), res, p.model);
+        }
+        const d = await up.json();
+        log(reqId, `← 200 gemini responses (${Date.now() - startTime}ms)`);
+        return J(res, 200, convertGeminiResponseToResponses(d, p.model));
+      }
+    } catch (e) {
+      logErr(reqId, `← 502 proxy error: ${e.message}`);
+      return J(res, 502, {
+        error: { message: e.message, type: "proxy_error" },
+      });
+    }
+  }
+
+  // ═══════════════════════════════════════════════════════
   //  /v1/messages — Anthropic 原生 API 透传
   //  Claude Code 等原生 Anthropic 客户端直接使用此端点
   // ═══════════════════════════════════════════════════════
@@ -1144,12 +1864,12 @@ createServer(async (req, res) => {
   const base = `https://${domain}/v1`;
   console.log(`\n========================================`);
   console.log(`  Replit AI Proxy 已启动`);
-  console.log(`  支持 OpenAI <-> Claude Tool Calling 双向协议转换`);
+  console.log(`  支持 Chat Completions / Responses API / Anthropic 原生透传`);
   console.log(`========================================`);
   console.log(`  Base URL : ${base}`);
   console.log(`  API Key  : ${KEY}`);
   console.log(`========================================`);
-  console.log(`  用法示例 (curl):`);
+  console.log(`  Chat Completions (OpenAI 兼容):`);
   console.log(`  curl ${base}/chat/completions \\`);
   console.log(`    -H "Authorization: Bearer ${KEY}" \\`);
   console.log(`    -H "Content-Type: application/json" \\`);
@@ -1157,20 +1877,22 @@ createServer(async (req, res) => {
     `    -d '{"model":"claude-sonnet-4-6","messages":[{"role":"user","content":"hi"}]}'`,
   );
   console.log(`========================================`);
-  console.log(`  Anthropic 原生 API 透传 (Claude Code 等):`);
-  console.log(
-    `  模型名: 原样透传给上游 API (claude-opus-4-6, claude-sonnet-4-6 等)`,
-  );
-  console.log(`  ANTHROPIC_BASE_URL=${base.replace("/v1", "")} \\`);
-  console.log(`  ANTHROPIC_API_KEY=${KEY} \\`);
-  console.log(`  claude`);
-  console.log(`========================================`);
-  console.log(`  Tool Calling 示例:`);
-  console.log(`  curl ${base}/chat/completions \\`);
+  console.log(`  Responses API (Codex CLI 等):`);
+  console.log(`  curl ${base}/responses \\`);
   console.log(`    -H "Authorization: Bearer ${KEY}" \\`);
   console.log(`    -H "Content-Type: application/json" \\`);
   console.log(
-    `    -d '{"model":"claude-sonnet-4-6","messages":[{"role":"user","content":"What is the weather in Tokyo?"}],"tools":[{"type":"function","function":{"name":"get_weather","description":"Get weather","parameters":{"type":"object","properties":{"location":{"type":"string"}},"required":["location"]}}}]}'`,
+    `    -d '{"model":"claude-opus-4-7","input":"hi"}'`,
   );
+  console.log(`  ────────────────────────────────────`);
+  console.log(`  Codex CLI 配置:`);
+  console.log(`  OPENAI_BASE_URL=${base.replace("/v1", "")} \\`);
+  console.log(`  OPENAI_API_KEY=${KEY} \\`);
+  console.log(`  codex --model claude-opus-4-7`);
+  console.log(`========================================`);
+  console.log(`  Anthropic 原生透传 (Claude Code 等):`);
+  console.log(`  ANTHROPIC_BASE_URL=${base.replace("/v1", "")} \\`);
+  console.log(`  ANTHROPIC_API_KEY=${KEY} \\`);
+  console.log(`  claude`);
   console.log(`========================================\n`);
 });
